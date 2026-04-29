@@ -1,4 +1,5 @@
 from app.application.memory.interfaces.fact_reranker import FactReranker
+from app.core.logging import TraceContext, elapsed_ms, log_step_error, log_step_start, log_step_success
 from app.domain.memory.retrieval import MemoryFactCandidate, RerankerFact
 from app.errors import GatewayError
 from app.infrastructure.llm.base_client import BaseLLMClient
@@ -20,12 +21,27 @@ class LLMReranker(FactReranker):
 
     async def rerank(self, query: str, candidates: list[MemoryFactCandidate], top_n: int) -> list[RerankerFact]:
         started_at = time.perf_counter()
+        trace = TraceContext(session_id=None, trace_id="infra-reranker")
+        log_step_start(
+            trace,
+            "reranker",
+            "rerank",
+            message="Запуск reranker",
+            meta={"query_length": len(query.strip()), "candidates_count": len(candidates), "top_n": top_n},
+        )
         if not candidates:
             self._last_diagnostics = self.build_rerank_diagnostics(
                 rerank_input_count=0,
                 rerank_output_count=0,
                 rerank_ms=(time.perf_counter() - started_at) * 1000,
                 model_name=self.model,
+            )
+            log_step_success(
+                trace,
+                "reranker",
+                "rerank",
+                message="Кандидаты отсутствуют, возвращён пустой результат",
+                duration_ms=elapsed_ms(started_at),
             )
             return []
 
@@ -54,8 +70,6 @@ class LLMReranker(FactReranker):
             {"role": "user", "content": user_prompt},
         ]
         parsed = self._request_and_parse_with_retries(messages=messages)
-        print(f'Кандидаты: {candidates}')
-        print(f'Ответ реранкера: {parsed}')
         if parsed is None:
             fallback_result = self._fallback_by_vector_score(candidates=candidates, top_n=top_n)
             self._last_diagnostics = self.build_rerank_diagnostics(
@@ -65,6 +79,14 @@ class LLMReranker(FactReranker):
                 model_name=self.model,
                 fallback_reason="invalid_json_after_3_attempts",
             )
+            log_step_success(
+                trace,
+                "reranker",
+                "rerank",
+                message="Применён fallback по vector_score",
+                duration_ms=elapsed_ms(started_at),
+                meta={"fallback_reason": "invalid_json_after_3_attempts", "output_count": len(fallback_result)},
+            )
             return fallback_result
         if not parsed or "items" not in parsed or not isinstance(parsed["items"], list):
             self._last_diagnostics = self.build_rerank_diagnostics(
@@ -72,6 +94,14 @@ class LLMReranker(FactReranker):
                 rerank_output_count=0,
                 rerank_ms=(time.perf_counter() - started_at) * 1000,
                 model_name=self.model,
+            )
+            log_step_success(
+                trace,
+                "reranker",
+                "rerank",
+                message="Reranker вернул пустой или некорректный items",
+                duration_ms=elapsed_ms(started_at),
+                meta={"output_count": 0},
             )
             return []
 
@@ -115,6 +145,14 @@ class LLMReranker(FactReranker):
             rerank_ms=(time.perf_counter() - started_at) * 1000,
             model_name=self.model,
         )
+        log_step_success(
+            trace,
+            "reranker",
+            "rerank",
+            message="Reranker завершён",
+            duration_ms=elapsed_ms(started_at),
+            meta={"output_count": len(result), "model_name": self.model},
+        )
         return result
 
     def get_final_score(self, rerank_score: float, vector_score: float) -> float:
@@ -147,7 +185,8 @@ class LLMReranker(FactReranker):
         return fallback_facts[:top_n]
 
     def _request_and_parse_with_retries(self, messages: list[dict[str, str]]) -> dict | None:
-        for _ in range(MAX_RERANK_PARSE_ATTEMPTS):
+        trace = TraceContext(session_id=None, trace_id="infra-reranker")
+        for attempt in range(1, MAX_RERANK_PARSE_ATTEMPTS + 1):
             raw_result = self.client.request_content(
                 messages,
                 model=self.model,
@@ -155,7 +194,15 @@ class LLMReranker(FactReranker):
             )
             try:
                 return parse_json(raw_result)
-            except GatewayError:
+            except GatewayError as error:
+                log_step_error(
+                    trace,
+                    "reranker",
+                    "parse_json",
+                    error=error,
+                    message="Ошибка парсинга ответа reranker, будет повтор",
+                    meta={"attempt": attempt, "max_attempts": MAX_RERANK_PARSE_ATTEMPTS},
+                )
                 continue
         return None
 
